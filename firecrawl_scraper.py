@@ -6,8 +6,9 @@ load_dotenv()
 def main():
     # 1. Set your API key and target URL here
     API_KEY = os.getenv("fc-API-KEY")  # Replace with your actual Firecrawl API key
-    TARGET_URL = "https://www.amazon.in/gp/bestsellers" # Replace with the URL you want to scrape
-    OUTPUT_FILE = "scraped_data.md"
+    TARGET_URL = "https://www.fca.org.uk/markets/sftr" # Replace with the URL you want to scrape
+    # TARGET_URL = "https://www.amazon.in/gp/bestsellers" # Replace with the URL you want to scrape
+    OUTPUT_FILE = "scraped_data1.md"
 
     print(f"Initializing Firecrawl app...")
     try:

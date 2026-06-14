@@ -5,6 +5,8 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "beautifulsoup4>=4.15.0",
     "firecrawl-py>=4.28.2",
     "python-dotenv>=1.2.2",
+    "requests>=2.34.2",
 ]
