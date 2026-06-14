@@ -1,96 +1,176 @@
-import requests
-from bs4 import BeautifulSoup
+import asyncio
 import os
-import time
+import random
+from urllib.parse import urljoin, urlparse
+from bs4 import BeautifulSoup
+from playwright.async_api import async_playwright
 
-def main():
-    TARGET_URL = "https://www.amazon.in/gp/bestsellers" 
-    OUTPUT_FILE = "scraped_data_bs4_rep.md"
+# ==========================================
+# ⚙️ CONFIGURATION SECTION
+# ==========================================
+TARGET_URL = "https://www.amazon.in/gp/bestsellers"      # The starting URL
+MAX_DEPTH = 1                           # 0 = Main page only, 1 = Main page + its sub-links
+OUTPUT_FILE = "data.md"                 # Where the scraped text will be saved
+
+# --- PAGINATION SETTINGS ---
+# Set to 'scroll', 'button', or 'none' depending on the target website
+PAGINATION_MODE = 'none'                
+
+# If using 'button' mode, you MUST update this CSS selector to match the target site!
+# Examples: ".next-page", "button#load-more", "a.pagination-next"
+NEXT_BUTTON_SELECTOR = ".next-page"     
+# ==========================================
+
+# Track visited URLs globally to prevent infinite loops
+visited_urls = set()
+
+async def human_delay(min_s=1.5, max_s=4.0):
+    """Introduces a randomized delay to bypass behavioral WAF detection."""
+    await asyncio.sleep(random.uniform(min_s, max_s))
+
+def extract_and_save_text(html_content, url, current_depth, title):
+    """Uses Beautiful Soup to clean the HTML and save raw text to a Markdown file."""
+    soup = BeautifulSoup(html_content, "html.parser")
     
-    # Configure your test settings
-    TOTAL_ATTEMPTS = 50   # How many times you want to run the loop
-    DELAY_BETWEEN_REQUESTS = 0 # Delay in seconds to see how aggressive their rate-limiting is
+    # Remove structural noise (menus, scripts, styles, footers)
+    for element in soup(["script", "style", "nav", "footer", "header", "aside", "noscript"]):
+        element.decompose()
+    
+    # Extract clean human-readable text
+    clean_text = soup.get_text(separator="\n", strip=True)
 
-    # Use headers to mimic a real web browser
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-        'Referer': 'https://www.google.com/'
-    }
+    # Append to the data.md file
+    with open(OUTPUT_FILE, "a", encoding="utf-8") as f:
+        f.write(f"\n\n# URL: {url}\n")
+        f.write(f"## Title: {title}\n")
+        f.write(f"### Depth Level: {current_depth}\n")
+        f.write(f"---\n\n{clean_text}\n")
+        f.write("\n" + "="*50 + "\n")
 
-    # Initialize counters
-    success_count = 0
-    blocked_count = 0
+async def handle_infinite_scroll(page):
+    """Scrolls to the bottom of a dynamically loading page until it stops growing."""
+    print("Initiating infinite scroll...")
+    last_height = await page.evaluate("document.body.scrollHeight")
+    
+    while True:
+        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        await human_delay(2.5, 4.5) # Wait for network requests to fetch new items
+        
+        new_height = await page.evaluate("document.body.scrollHeight")
+        if new_height == last_height:
+            print("Reached the bottom of the infinite scroll.")
+            break
+        last_height = new_height
 
-    # Clear or initialize the markdown file with a header
-    with open(OUTPUT_FILE, "w", encoding="utf-8") as file:
-        file.write(f"# Rate Limit & Block Testing for {TARGET_URL}\n\n")
-        file.write("| Attempt | Status Code | Result | Timestamp |\n")
-        file.write("|---|---|---|---|\n")
+async def handle_button_pagination(page):
+    """Clicks the 'Next' button repeatedly until it disappears."""
+    print("Initiating button pagination...")
+    page_num = 1
+    
+    while True:
+        await human_delay(2.0, 4.0)
+        button = page.locator(NEXT_BUTTON_SELECTOR)
+        
+        if await button.count() > 0 and await button.is_visible():
+            print(f"Clicking 'Next' button to load page {page_num + 1}...")
+            await button.click()
+            await page.wait_for_load_state("domcontentloaded")
+            page_num += 1
+        else:
+            print("No more 'Next' button found. Pagination complete.")
+            break
 
-    print(f"Starting test: Making {TOTAL_ATTEMPTS} requests to {TARGET_URL}...\n")
+async def scrape_page(page, url, current_depth, base_domain):
+    """Core recursive function to navigate, handle pagination, and extract links."""
+    if url in visited_urls or current_depth > MAX_DEPTH:
+        return
+    
+    if urlparse(url).netloc != base_domain:
+        return
 
-    for i in range(1, TOTAL_ATTEMPTS + 1):
-        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-        print(f"[{timestamp}] Attempt {i}/{TOTAL_ATTEMPTS}...", end=" ", flush=True)
+    print(f"[Depth {current_depth}] Navigating to: {url}")
+    visited_urls.add(url)
 
-        try:
-            # Fetch the webpage
-            response = requests.get(TARGET_URL, headers=headers, timeout=15)
-            status_code = response.status_code
-            
-            # Check for HTTP errors
-            response.raise_for_status()
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+        await human_delay(2, 4) 
 
-            # Parse the HTML to verify content actually exists
-            soup = BeautifulSoup(response.content, 'html.parser')
-            content = soup.get_text(strip=True)
+        # Only run pagination logic on the main index page (Depth 0)
+        if current_depth == 0:
+            if PAGINATION_MODE == 'scroll':
+                await handle_infinite_scroll(page)
+            elif PAGINATION_MODE == 'button':
+                await handle_button_pagination(page)
 
-            if "api-services-support@amazon.com" in content or "Robot Check" in soup.title.text if soup.title else False:
-                # Catching Amazon's soft-block (where status is 200 but page is a Captcha)
-                print("BLOCKED (Captcha Page)")
-                blocked_count += 1
-                log_entry = f"| {i} | {status_code} | ❌ Blocked (Captcha/Robot Check Page) | {timestamp} |\n"
-            elif not content:
-                print("EMPTY RESPONSE")
-                log_entry = f"| {i} | {status_code} | ⚠️ Empty Page Body | {timestamp} |\n"
-            else:
-                print("SUCCESS")
-                success_count += 1
-                log_entry = f"| {i} | {status_code} |  Success | {timestamp} |\n"
+        # Extract page HTML and title AFTER pagination has fully loaded the DOM
+        html_content = await page.content()
+        title = await page.title()
+        
+        # Parse and save the text
+        extract_and_save_text(html_content, url, current_depth, title)
 
-        except requests.exceptions.HTTPError as e:
-            # Handles explicit HTTP errors like 403 Forbidden or 503 Service Unavailable
-            status_code = e.response.status_code if e.response is not None else "Unknown"
-            print(f"BLOCKED (HTTP {status_code})")
-            blocked_count += 1
-            log_entry = f"| {i} | {status_code} | ❌ Blocked ({e}) | {timestamp} |\n"
+        # If we are allowed to go deeper, harvest links from the current page state
+        if current_depth < MAX_DEPTH:
+            print(f"[Depth {current_depth}] Extracting sub-links...")
+            links = await page.evaluate("""() => {
+                return Array.from(document.querySelectorAll('a'))
+                            .map(anchor => anchor.getAttribute('href'))
+                            .filter(href => href !== null);
+            }""")
 
-        except requests.exceptions.RequestException as e:
-            # Handles connection drops, timeouts, DNS issues
-            print("FAILED (Network Error)")
-            log_entry = f"| {i} | Error | 💥 Connection Failed ({str(e)[:50]}...) | {timestamp} |\n"
+            discovered_urls = set()
+            for link in links:
+                # Clean up the link and make sure it's an absolute URL
+                full_url = urljoin(url, link).split('#')[0] 
+                if full_url not in visited_urls and urlparse(full_url).netloc == base_domain:
+                    discovered_urls.add(full_url)
 
-        # Append the result of this iteration directly into the markdown file
-        with open(OUTPUT_FILE, "a", encoding="utf-8") as file:
-            file.write(log_entry)
+            # Sequentially process discovered links to avoid IP rate-limiting
+            for next_url in discovered_urls:
+                await scrape_page(page, next_url, current_depth + 1, base_domain)
 
-        # Break early or add a delay before the next hit
-        if i < TOTAL_ATTEMPTS:
-            time.sleep(DELAY_BETWEEN_REQUESTS)
+    except Exception as e:
+        print(f"Failed to scrape {url}: {e}")
 
-    # Append final summary at the bottom of the file
-    summary = (
-        f"\n\n## Test Summary\n"
-        f"* **Total Attempts:** {TOTAL_ATTEMPTS}\n"
-        f"* **Successful Requests:** {success_count}\n"
-        f"* **Blocked/Failed Requests:** {TOTAL_ATTEMPTS - success_count}\n"
-    )
-    with open(OUTPUT_FILE, "a", encoding="utf-8") as file:
-        file.write(summary)
+async def main():
+    if os.path.exists(OUTPUT_FILE):
+        os.remove(OUTPUT_FILE)
+        
+    print(f"Starting Scraper targeting: {TARGET_URL}")
+    base_domain = urlparse(TARGET_URL).netloc
 
-    print(f"\nTesting complete! Summary metrics appended to {OUTPUT_FILE}")
+    async with async_playwright() as p:
+        # Launch stealth browser
+        browser = await p.chromium.launch(headless=True)
+        
+        # Configure context to mimic a legitimate desktop user
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            viewport={"width": 1920, "height": 1080},
+            locale="en-US",
+            timezone_id="America/New_York",
+            device_scale_factor=1,
+            extra_http_headers={
+                "Accept-Language": "en-US,en;q=0.9",
+                "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+                "Sec-Ch-Ua-Mobile": "?0",
+                "Sec-Ch-Ua-Platform": '"Windows"',
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "none",
+                "Sec-Fetch-User": "?1",
+                "Upgrade-Insecure-Requests": "1"
+            }
+        )
+
+        page = await context.new_page()
+
+        # Begin recursive crawl
+        await scrape_page(page, TARGET_URL, 0, base_domain)
+
+        await context.close()
+        await browser.close()
+        print(f"\n✅ Scraping complete. All data saved to '{OUTPUT_FILE}'.")
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
